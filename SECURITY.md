@@ -136,3 +136,37 @@ Under these assumptions, the protocol ensures safe peer‑to‑peer swaps.
 Conclusion
 SecureEthUsdcSwapV3 combines cryptographic commitments, economic incentives, and strict state enforcement to create a robust trustless swap protocol.
 The design aims to make dishonest behavior economically irrational while enabling honest users to exchange assets safely without intermediaries.
+
+
+
+
+
+
+
+
+## Reporting a Vulnerability
+
+If you discover a security vulnerability in this repository or in the
+SecureEthUsdcSwapV3 smart contract, please report it responsibly.
+
+### How to report
+  We aim to acknowledge reports within 72 hours.
+- Send a detailed report to: **asperant001@gmail.com**
+- Include:
+  - contract address
+  - network (Base Mainnet or Sepolia)
+  - description of the issue
+  - potential impact
+  - steps to reproduce (if applicable)
+
+Please do **not** open public GitHub issues or disclose the vulnerability
+publicly before it has been reviewed.
+
+## Bug Bounty
+
+At this time, there is **no active bug bounty program**.
+
+Valid vulnerability reports will be acknowledged and reviewed in good faith.
+
+Please do not perform denial-of-service attacks or exploit vulnerabilities
+against production systems.
