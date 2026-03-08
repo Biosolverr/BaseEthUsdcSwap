@@ -1,0 +1,35 @@
+# Compiler Configuration
+
+The SecureEthUsdcSwapV3 contract was compiled and verified using the following configuration.
+
+---
+
+## Compiler
+
+- Language: Solidity
+- Version: v0.8.26
+- EVM version: cancun
+
+---
+
+## Optimizer
+
+- Enabled: true
+- Runs: 200
+- viaIR: true
+
+---
+
+## Build Input
+
+The original Standard JSON Input used during verification was not preserved at deployment time.
+
+The file located at:
+
+build/compilerInput.json
+
+is a reconstructed Standard JSON Input derived from:
+- verified source code on BaseScan
+- on-chain compiler settings
+
+The resulting bytecode matches the deployed contract exactly.
