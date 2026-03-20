@@ -1,79 +1,114 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.28;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/**
- * ╔══════════════════════════════════════════════════════════════════╗
- * ║       ETH ↔ USDC ATOMIC SWAP — FULL THREAT MODEL v3            ║
- * ║                                                                  ║
- * ║  Security fixes:                                                 ║
- * ║  [FIX1] Symmetric MAD      — B also loses collateral            ║
- * ║  [FIX2] Commit-reveal      — MEV / frontrun protection          ║
- * ║  [FIX3] Warp-speed griefing— repeated fund/refund cycle         ║
- * ║  [FIX4] Collusion attack   — A+B conspiring against protocol    ║
- * ║  [FIX5] Secret length      — short-input hash collision          ║
- * ║  [FIX6] Timestamp drift    — validator block.timestamp drift     ║
- * ╚══════════════════════════════════════════════════════════════════╝
- */
-contract SecureEthUsdcSwapV3 is ReentrancyGuard {
+//  SecureEthUsdcSwap — ETH <-> USDC Atomic Swap v9.0
+//  Author: SecureSwap Team
+//  Trustless peer-to-peer atomic swap between ETH and USDC with
+//  symmetric MAD collateral, reputation scoring, and anti-griefing.
+//  Final merged version: v8.0 architecture + v7.3 API refinements.
+//
+//  SECURITY FIXES:
+//
+//  [CRIT]  refund() counterparty access on FUNDED swaps.
+//          Counterparty may call refund() once the reveal window closes
+//          (revealDeadline + TIMESTAMP_DRIFT_BUFFER), not only after the
+//          full swap deadline. Eliminates permanent USDC lock when initiator
+//          disappears and closes the cross-chain timing exploit.
+//
+//  [CRIT]  Dead zone (~30 min) eliminated.
+//          Previously: complete() closed at revealDeadline+15s, refund()
+//          opened at deadline+15s. Fix: FUNDED refunds open at
+//          revealDeadline+15s (adjacent windows).
+//
+//  [HIGH]  withdraw() split into withdrawEth() / withdrawUsdc().
+//          USDC blacklisting no longer blocks ETH recovery.
+//
+//  [MED]   Bidirectional collusion detection via canonical pair key.
+//
+//  [LOW]   ETH burns are now real: _burnEth() does payable(0xdEaD).call{value}.
+//
+//  [LOW]   fund() checks collusion flag for designated counterparties too.
+//
+//  [LOW]   cancel() restricted to beforeDeadline + TIMESTAMP_DRIFT_BUFFER.
+//
+//  API REFINEMENTS (from v7.3):
+//  - pendingEthWithdrawals: explicit naming over generic pendingWithdrawals
+//  - error NotInitiatorOrCounterparty: more descriptive than NotParty
+//  - event Refunded includes indexed caller address
+//  - getPendingWithdrawals(address) view function added
+//  - getPairGriefCount returns canonical order-independent count
+//
+//  INTENTIONAL DESIGN DECISIONS:
+//  - usedSecretHashes is permanent (not cleared on cancel/refund).
+//  - USDC burn is logical (tokens stay in contract).
+
+// ════════════════════════════════════════════════════════════════
+//  CUSTOM ERRORS
+// ════════════════════════════════════════════════════════════════
+
+error EmptyCommitment();
+error AlreadyCommitted();
+error NotYourCommitment();
+error CommitmentUsed();
+error CommitmentExpired();
+error EthTooSmall();
+error UsdcTooSmall();
+error DurationTooShort();
+error DurationTooLong();
+error EmptySecretHash();
+error EmptyNonce();
+error SelfSwap();
+error CollusionFlagActive();
+error SecretHashReused();
+error InitiateCooldownActive();
+error TooManyActiveSwaps();
+error WrongEthDeposit();
+error BufferTooShort();
+error IdCollision();
+error WrongState();
+error NotInitiator();
+error NotCounterparty();
+error NotInitiatorOrCounterparty();
+error Expired();
+error NotExpired();
+error RevealWindowClosed();
+error EmptySecret();
+error WrongSecret();
+error SelfFund();
+error FundCooldownActive();
+error CannotRefund();
+error NothingToWithdraw();
+error EthWithdrawFailed();
+error EthBurnFailed();
+error VolumeOverflow();
+error InvalidAddress();
+error UseInitiateFromCommit();
+
+/// @title  SecureEthUsdcSwap — ETH <-> USDC Atomic Swap v9.0
+/// @author SecureSwap Team
+/// @notice Trustless peer-to-peer atomic swap between ETH and USDC with
+///         symmetric MAD collateral, reputation scoring, and anti-griefing.
+/// @dev    Final merged version: v8.0 architecture + v7.3 API refinements.
+contract SecureEthUsdcSwap is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ════════════════════════════════════════════════════════════════
-    //  CONSTANTS
+    //  ENUMS
     // ════════════════════════════════════════════════════════════════
 
-    IERC20 public immutable USDC;
+    /// @notice Actions tracked by the reputation system
+    enum RepAction {
+        COMPLETED,
+        GRIEFED,
+        VICTIMIZED,
+        CANCELLED
+    }
 
-    // [FIX6] Maximum timestamp drift allowed from a validator.
-    // EIP-1559: validator can shift block.timestamp by ±12 sec (1 slot).
-    // We add a 15-second buffer to every time boundary check.
-    uint256 public constant TIMESTAMP_DRIFT_BUFFER = 15 seconds;
-
-    uint256 public constant MIN_DURATION           = 10 minutes;
-    uint256 public constant MAX_DURATION           = 7 days;
-    uint256 public constant SECRET_REVEAL_BUFFER   = 30 minutes;
-
-    uint256 public constant MIN_ETH                = 0.001 ether;
-    uint256 public constant MIN_USDC               = 1e6;           // 1 USDC (6 decimals)
-
-    // [FIX1] Symmetric MAD: both parties lose collateral on violation
-    uint256 public constant COLLATERAL_BPS         = 500;           // 5%
-    uint256 public constant BPS_DENOMINATOR        = 10_000;
-
-    uint256 public constant PREMIUM_BPS            = 200;           // 2%
-    uint256 public constant MIN_PREMIUM            = 0.0005 ether;
-
-    uint256 public constant MAX_ACTIVE_PER_USER    = 5;
-    uint256 public constant INITIATE_COOLDOWN      = 2 minutes;
-
-    // [FIX2] Commit-reveal: commitment is valid for this window only
-    uint256 public constant COMMIT_EXPIRY          = 10 minutes;
-
-    // [FIX3] Warp-speed griefing: minimum interval between fund() calls
-    // from the same address — prevents rapid fund → refund cycling
-    uint256 public constant FUND_COOLDOWN          = 1 minutes;
-
-    // [FIX5] Secret is strictly bytes32 (32 bytes enforced by type).
-    // Combined with abi.encode(secret, nonce) → fixed 64-byte preimage,
-    // this fully prevents length-extension and short-input attacks.
-    uint256 public constant SECRET_LENGTH          = 32;
-
-    // Burn address (address(1) — unrecoverable)
-    address public constant BURN_ADDRESS           = address(1);
-
-    // ════════════════════════════════════════════════════════════════
-    //  STATES — finite automaton
-    //
-    //  EMPTY → INITIATED → FUNDED → COMPLETED
-    //                    ↘         (time expired)
-    //                   REFUNDED
-    //          ↘
-    //        CANCELLED  (only before B funds)
-    // ════════════════════════════════════════════════════════════════
-
+    /// @notice Swap lifecycle states
     enum State {
         EMPTY,
         INITIATED,
@@ -87,47 +122,41 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
     //  STRUCTS
     // ════════════════════════════════════════════════════════════════
 
+    /// @notice On-chain reputation record for a user
+    struct Reputation {
+        uint64  completed;
+        uint64  griefed;
+        uint64  victimized;
+        uint64  cancelled;
+        uint128 volumeGwei;
+    }
+
+    /// @notice Full state of an atomic swap
     struct Swap {
         address payable initiator;
         address payable counterparty;
-
         uint256 ethAmount;
         uint256 usdcAmount;
-
-        // [FIX1] Symmetric collateral
-        uint256 aCollateral;   // 5% of ethAmount  — deposited by A in ETH
-        uint256 bCollateral;   // 5% of usdcAmount — deposited by B in USDC
-
-        uint256 aPremium;      // 2% of ethAmount  — griefing insurance by A
-
+        uint256 aCollateral;
+        uint256 bCollateral;
+        uint256 aPremium;
         uint256 createdAt;
         uint256 deadline;
         uint256 revealDeadline;
-
-        bytes32 secretHash;    // keccak256(abi.encode(secret, nonce))
-        bytes32 nonce;         // unique per swap — replay protection
-        bytes32 secret;        // revealed only at completion
-
+        bytes32 secretHash;
+        bytes32 nonce;
+        bytes32 secret;
         State   state;
     }
 
-    // [FIX2] Commit-reveal structure
+    /// @notice Commit-reveal commitment record
     struct Commitment {
         address initiator;
         uint256 createdAt;
         bool    used;
     }
 
-    // Reputation — on-chain history of address behaviour
-    struct Reputation {
-        uint64 completed;
-        uint64 refunded;
-        uint64 griefed;
-        uint64 cancelled;
-        uint64 totalVolumeGwei;
-    }
-
-    // [FIX3] Per-address rate limiting data
+    /// @notice Per-user rate limiting state
     struct RateLimit {
         uint256 lastInitiatedAt;
         uint256 lastFundedAt;
@@ -135,18 +164,60 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
     }
 
     // ════════════════════════════════════════════════════════════════
+    //  CONSTANTS
+    // ════════════════════════════════════════════════════════════════
+
+    /// @notice USDC token contract (immutable, set in constructor)
+    IERC20 public immutable USDC;
+
+    uint256 private constant TIMESTAMP_DRIFT_BUFFER = 15 seconds;
+    uint256 private constant MIN_DURATION           = 1 hours;
+    uint256 private constant MAX_DURATION           = 7 days;
+    uint256 private constant SECRET_REVEAL_BUFFER   = 30 minutes;
+    uint256 private constant MIN_ETH                = 0.001 ether;
+    uint256 private constant MIN_USDC               = 1e6;
+    uint256 private constant COLLATERAL_BPS         = 500;
+    uint256 private constant BPS_DENOMINATOR        = 10_000;
+    uint256 private constant PREMIUM_BPS            = 200;
+    uint256 private constant MIN_PREMIUM            = 0.0005 ether;
+    uint256 private constant MAX_ACTIVE_PER_USER    = 5;
+    uint256 private constant INITIATE_COOLDOWN      = 2 minutes;
+    uint256 private constant COMMIT_EXPIRY          = 10 minutes;
+    uint256 private constant FUND_COOLDOWN          = 1 minutes;
+    uint32  private constant COLLUSION_THRESHOLD    = 2;
+    uint256 private constant COLLUSION_FLAG_TIMEOUT = 30 days;
+
+    /// @notice ETH physical burn target.
+    /// @dev    Pure EOA on Ethereum mainnet — low-level call always succeeds.
+    ///         Verify before deploying on L2s where this address may have code.
+    address private constant BURN_ADDRESS = address(0xdEaD);
+
+    // ════════════════════════════════════════════════════════════════
     //  STORAGE
     // ════════════════════════════════════════════════════════════════
 
-    mapping(bytes32 => Swap)                         public swaps;
-    mapping(bytes32 => Commitment)                   public commitments;
-    mapping(address => Reputation)                   public reputation;
-    mapping(address => RateLimit)                    public rateLimit;
-    mapping(bytes32 => bool)                         public usedSecretHashes;
-    mapping(address => uint256)                      public pendingWithdrawals;
+    mapping(bytes32 swapId     => Swap)        public swaps;
+    mapping(bytes32 commitHash => Commitment)  public commitments;
+    mapping(address user       => Reputation)  public reputation;
+    mapping(address user       => RateLimit)   public rateLimit;
+    mapping(bytes32 hash       => bool used)   public usedSecretHashes;
 
-    // [FIX4] collusionFlag[A][B] = true → A and B are banned from swapping
-    mapping(address => mapping(address => bool))     public collusionFlag;
+    /// @notice Pending ETH withdrawal balances (pull-payment)
+    mapping(address user => uint256 eth)  public pendingEthWithdrawals;
+    /// @notice Pending USDC withdrawal balances (pull-payment)
+    mapping(address user => uint256 usdc) public pendingUsdcWithdrawals;
+
+    /// @notice Canonical-pair grief counter: key always (min(a,b) -> max(a,b)).
+    /// @dev    A->B and B->A grief both increment the same slot.
+    ///         Query via getPairGriefCount() for order-independent access.
+    mapping(address lo => mapping(address hi => uint32 count))   public pairGriefCount;
+    mapping(address a  => mapping(address b  => bool flagged))   public collusionFlag;
+    mapping(address a  => mapping(address b  => uint256 expiry)) public collusionFlagExpiry;
+
+    /// @notice USDC logically burned (remains in contract, permanently inaccessible)
+    uint256 public burnedUsdcTotal;
+    /// @notice ETH physically burned (sent to 0xdEaD, removed from balance)
+    uint256 public burnedEthTotal;
 
     // ════════════════════════════════════════════════════════════════
     //  EVENTS
@@ -172,36 +243,37 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
         bytes32 nonce
     );
 
-    event Funded(
-        bytes32 indexed swapId,
-        address indexed counterparty,
-        uint256 timestamp
-    );
+    event Funded(bytes32 indexed swapId, address indexed counterparty);
 
-    event Completed(
-        bytes32 indexed swapId,
-        bytes32 secret,
-        uint256 timestamp
-    );
+    event Completed(bytes32 indexed swapId, bytes32 secret);
 
-    event Refunded(
-        bytes32 indexed swapId,
-        bool    aGriefed,
-        bool    bGriefed,
-        uint256 timestamp
-    );
+    /// @notice Emitted when a swap is refunded.
+    /// @param caller Address that triggered the refund (initiator or counterparty)
+    event Refunded(bytes32 indexed swapId, bool griefed, address indexed caller);
 
-    event Cancelled(bytes32 indexed swapId, uint256 timestamp);
-    event CollusionFlagged(address indexed a, address indexed b);
-    event WithdrawalQueued(address indexed recipient, uint256 amount);
-    event Withdrawn(address indexed recipient, uint256 amount);
+    event Cancelled(bytes32 indexed swapId);
+
+    event CollusionFlagged(address indexed a, address indexed b, uint256 expiry);
+
+    event EthQueued(address indexed recipient, uint256 amount);
+    event UsdcQueued(address indexed recipient, uint256 amount);
+    event EthWithdrawn(address indexed recipient, uint256 amount);
+    event UsdcWithdrawn(address indexed recipient, uint256 amount);
+
+    /// @notice ETH physically sent to 0xdEaD
+    event EthBurned(uint256 amount);
+    /// @notice USDC logically burned (stays in contract)
+    event UsdcBurned(uint256 amount);
+
+    event ReputationUpdated(address indexed user, RepAction indexed action);
 
     // ════════════════════════════════════════════════════════════════
     //  CONSTRUCTOR
     // ════════════════════════════════════════════════════════════════
 
-    constructor(address _usdc) {
-        require(_usdc != address(0), "Zero address");
+    /// @param _usdc Address of the USDC ERC-20 contract
+    constructor(address _usdc) payable {
+        if (_usdc == address(0)) revert InvalidAddress();
         USDC = IERC20(_usdc);
     }
 
@@ -209,107 +281,213 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
     //  MODIFIERS
     // ════════════════════════════════════════════════════════════════
 
+    /// @dev Requires swap to be in a specific state
     modifier onlyState(bytes32 id, State s) {
-        require(swaps[id].state == s, "Wrong state");
+        if (swaps[id].state != s) revert WrongState();
         _;
     }
 
+    /// @dev block.timestamp must be strictly before deadline + TIMESTAMP_DRIFT_BUFFER
     modifier beforeDeadline(bytes32 id) {
-        // [FIX6] Only consider swap expired after deadline + drift buffer
-        require(
-            block.timestamp < swaps[id].deadline + TIMESTAMP_DRIFT_BUFFER,
-            "Expired"
-        );
-        _;
-    }
-
-    modifier afterDeadline(bytes32 id) {
-        // [FIX6] Only allow refund when deadline has passed even with max drift
-        require(
-            block.timestamp >= swaps[id].deadline + TIMESTAMP_DRIFT_BUFFER,
-            "Not expired"
-        );
+        if (block.timestamp >= swaps[id].deadline + TIMESTAMP_DRIFT_BUFFER) revert Expired();
         _;
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  HELPER CALCULATIONS
+    //  PURE HELPERS
     // ════════════════════════════════════════════════════════════════
 
+    /// @notice Calculate ETH collateral (5%)
     function calcCollateralEth(uint256 ethAmount) public pure returns (uint256) {
         return (ethAmount * COLLATERAL_BPS) / BPS_DENOMINATOR;
     }
 
+    /// @notice Calculate USDC collateral (5%)
     function calcCollateralUsdc(uint256 usdcAmount) public pure returns (uint256) {
         return (usdcAmount * COLLATERAL_BPS) / BPS_DENOMINATOR;
     }
 
+    /// @notice Calculate premium: max(ethAmount x 2%, MIN_PREMIUM)
     function calcPremium(uint256 ethAmount) public pure returns (uint256) {
         uint256 p = (ethAmount * PREMIUM_BPS) / BPS_DENOMINATOR;
         return p < MIN_PREMIUM ? MIN_PREMIUM : p;
     }
 
-    /// @notice Total ETH A must send: ethAmount + collateral + premium
+    /// @notice Total ETH initiator must deposit
     function requiredEthDeposit(uint256 ethAmount) public pure returns (uint256) {
         return ethAmount + calcCollateralEth(ethAmount) + calcPremium(ethAmount);
     }
 
-    /// @notice Total USDC B must approve: usdcAmount + collateral
+    /// @notice Total USDC counterparty must deposit
     function requiredUsdcDeposit(uint256 usdcAmount) public pure returns (uint256) {
         return usdcAmount + calcCollateralUsdc(usdcAmount);
     }
 
+    /// @dev Normalise address pair to (lo, hi) where lo < hi.
+    ///      Ensures pairGriefCount is indexed consistently regardless of order.
+    function _canonicalPair(address a, address b)
+        internal pure returns (address lo, address hi)
+    {
+        (lo, hi) = a < b ? (a, b) : (b, a);
+    }
+
     // ════════════════════════════════════════════════════════════════
-    //  [FIX2] COMMIT-REVEAL — MEV / frontrunning protection
-    //
-    //  Problem without fix:
-    //  MEV bot sees initiate() in mempool → copies all params →
-    //  submits its own tx with higher gas → hijacks the swap.
-    //
-    //  Solution — two-phase protocol:
-    //
-    //  Phase 1: commitInitiate(commitment)
-    //    commitment = keccak256(abi.encode(
-    //        secretHash, nonce, counterparty,
-    //        ethAmount, usdcAmount, duration,
-    //        msg.sender, salt   ← private salt
-    //    ))
-    //    Only the hash is published — params are hidden.
-    //    MEV bot cannot reconstruct params → cannot copy the swap.
-    //
-    //  Phase 2: initiateFromCommit(commitment, params..., salt)
-    //    Params are revealed. Contract verifies commitment matches.
-    //    swapId is derived from commitment → already reserved.
-    //    Even if MEV sees phase 2, swapId belongs to the original sender.
+    //  COLLUSION DETECTION
     // ════════════════════════════════════════════════════════════════
 
+    /// @dev Returns true if the active collusion flag exists between a and b
+    function _isCollusionActive(address a, address b) internal view returns (bool) {
+        if (!collusionFlag[a][b]) return false;
+        return block.timestamp < collusionFlagExpiry[a][b];
+    }
+
+    /// @dev Set or refresh collusion flag (both directions) with 30-day expiry
+    function _flagCollusion(address a, address b) internal {
+        if (!collusionFlag[a][b] || block.timestamp >= collusionFlagExpiry[a][b]) {
+            collusionFlag[a][b] = true;
+            collusionFlag[b][a] = true;
+            uint256 expiry = block.timestamp + COLLUSION_FLAG_TIMEOUT;
+            collusionFlagExpiry[a][b] = expiry;
+            collusionFlagExpiry[b][a] = expiry;
+            emit CollusionFlagged(a, b, expiry);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  REPUTATION SYSTEM
+    // ════════════════════════════════════════════════════════════════
+
+    /// @dev Record successful swap; increment completed count and volume for both parties
+    function _repCompleted(
+        address initiator,
+        address counterparty,
+        uint256 ethAmount
+    ) internal {
+        Reputation storage repA = reputation[initiator];
+        Reputation storage repB = reputation[counterparty];
+
+        repA.completed++;
+        repB.completed++;
+
+        uint128 volumeToAdd = uint128(ethAmount / 1 gwei);
+
+        uint128 newVolA = repA.volumeGwei + volumeToAdd;
+        if (newVolA < repA.volumeGwei) revert VolumeOverflow();
+        repA.volumeGwei = newVolA;
+
+        uint128 newVolB = repB.volumeGwei + volumeToAdd;
+        if (newVolB < repB.volumeGwei) revert VolumeOverflow();
+        repB.volumeGwei = newVolB;
+
+        emit ReputationUpdated(initiator,    RepAction.COMPLETED);
+        emit ReputationUpdated(counterparty, RepAction.COMPLETED);
+    }
+
+    /// @dev Record griefing (initiator failed to reveal secret in time).
+    function _repGriefed(address initiator, address counterparty) internal {
+        Reputation storage repA = reputation[initiator];
+        Reputation storage repB = reputation[counterparty];
+
+        repA.griefed++;
+        repB.victimized++;
+
+        (address lo, address hi) = _canonicalPair(initiator, counterparty);
+        pairGriefCount[lo][hi]++;
+
+        if (pairGriefCount[lo][hi] >= COLLUSION_THRESHOLD) {
+            _flagCollusion(initiator, counterparty);
+        }
+
+        emit ReputationUpdated(initiator,    RepAction.GRIEFED);
+        emit ReputationUpdated(counterparty, RepAction.VICTIMIZED);
+    }
+
+    /// @dev Record swap cancellation (reputation penalty for initiator)
+    function _repCancelled(address initiator) internal {
+        reputation[initiator].cancelled++;
+        emit ReputationUpdated(initiator, RepAction.CANCELLED);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  PULL-PAYMENT INTERNALS
+    // ════════════════════════════════════════════════════════════════
+
+    /// @dev Queue ETH for pull-payment withdrawal
+    function _queueEth(address recipient, uint256 amount) internal {
+        if (amount != 0 && recipient != address(0)) {
+            pendingEthWithdrawals[recipient] += amount;
+            emit EthQueued(recipient, amount);
+        }
+    }
+
+    /// @dev Queue USDC for pull-payment withdrawal
+    function _queueUsdc(address recipient, uint256 amount) internal {
+        if (amount != 0 && recipient != address(0)) {
+            pendingUsdcWithdrawals[recipient] += amount;
+            emit UsdcQueued(recipient, amount);
+        }
+    }
+
+    /// @dev Logically burn USDC: increment counter, tokens remain in contract.
+    function _burnUsdc(uint256 amount) internal {
+        if (amount != 0) {
+            burnedUsdcTotal += amount;
+            emit UsdcBurned(amount);
+        }
+    }
+
+    /// @dev Physically burn ETH via low-level call to 0xdEaD.
+    function _burnEth(uint256 amount) internal {
+        if (amount != 0) {
+            burnedEthTotal += amount;
+            emit EthBurned(amount);
+            (bool ok,) = payable(BURN_ADDRESS).call{value: amount}("");
+            if (!ok) revert EthBurnFailed();
+        }
+    }
+
+    /// @dev Safely decrement active swap count (guards against underflow)
+    function _decrementActive(address user) internal {
+        if (rateLimit[user].activeCount != 0) {
+            rateLimit[user].activeCount--;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  STEP 0 — COMMIT (MEV protection)
+    // ════════════════════════════════════════════════════════════════
+
+    /// @notice Submit a commitment hash before initiating a swap.
+    /// @dev    Prevents front-running: parameters hidden until reveal step.
+    /// @param  commitment keccak256(abi.encode(secretHash, nonce, counterparty,
+    ///                    ethAmount, usdcAmount, duration, msg.sender, salt))
     function commitInitiate(bytes32 commitment) external {
-        require(commitment != bytes32(0),                         "Empty commitment");
-        require(commitments[commitment].initiator == address(0),  "Already committed");
+        if (commitment == bytes32(0)) revert EmptyCommitment();
+        if (commitments[commitment].initiator != address(0)) revert AlreadyCommitted();
 
         commitments[commitment] = Commitment({
-            initiator:  msg.sender,
-            createdAt:  block.timestamp,
-            used:       false
+            initiator: msg.sender,
+            createdAt: block.timestamp,
+            used:      false
         });
 
         emit CommitmentMade(commitment, msg.sender, block.timestamp + COMMIT_EXPIRY);
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  STEP 1 — INITIATE (requires prior commitment)
-    //
-    //  A deposits: ethAmount + aCollateral(5%) + aPremium(2%)
-    //  B will later deposit: usdcAmount + bCollateral(5%)
-    //
-    //  [FIX1] Symmetric collateral locked from both sides
-    //  [FIX2] Requires commitInitiate() in a prior block
-    //  [FIX3] Rate limit + cooldown enforced
-    //  [FIX4] Collusion flag checked
-    //  [FIX5] Secret type enforced as bytes32; verified with abi.encode
-    //  [FIX6] All time checks include drift buffer
+    //  STEP 1 — INITIATE
     // ════════════════════════════════════════════════════════════════
 
+    /// @notice Create a swap by revealing a previously submitted commitment.
+    /// @param  commitment   Commitment hash from commitInitiate()
+    /// @param  salt         Random salt used when building the commitment
+    /// @param  secretHash   keccak256(abi.encode(secret, nonce))
+    /// @param  nonce        Additional entropy bound into secretHash
+    /// @param  counterparty Designated counterparty; address(0) = open swap
+    /// @param  ethAmount    ETH to swap (wei)
+    /// @param  usdcAmount   USDC expected in return (atomic units)
+    /// @param  duration     Swap lifetime in seconds
+    /// @return swapId       Unique identifier for the created swap
     function initiateFromCommit(
         bytes32 commitment,
         bytes32 salt,
@@ -325,73 +503,54 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
         nonReentrant
         returns (bytes32 swapId)
     {
-        // ── [FIX2] verify commitment ─────────────────────────────────
         {
             bytes32 expected = keccak256(abi.encode(
                 secretHash, nonce, counterparty,
                 ethAmount, usdcAmount, duration,
                 msg.sender, salt
             ));
-            require(expected == commitment, "Commitment mismatch");
+            if (expected != commitment) revert EmptyCommitment();
         }
 
         Commitment storage c = commitments[commitment];
-        require(c.initiator == msg.sender,                        "Not your commitment");
-        require(!c.used,                                          "Commitment used");
-        require(block.timestamp <= c.createdAt + COMMIT_EXPIRY,   "Commitment expired");
+        if (c.initiator != msg.sender)                      revert NotYourCommitment();
+        if (c.used)                                          revert CommitmentUsed();
+        if (block.timestamp > c.createdAt + COMMIT_EXPIRY)  revert CommitmentExpired();
         c.used = true;
 
-        // ── basic validation ─────────────────────────────────────────
-        require(ethAmount  >= MIN_ETH,                            "ETH too small");
-        require(usdcAmount >= MIN_USDC,                           "USDC too small");
-        require(duration   >= MIN_DURATION,                       "Duration too short");
-        require(duration   <= MAX_DURATION,                       "Duration too long");
-        require(secretHash != bytes32(0),                         "Empty secretHash");
-        require(nonce      != bytes32(0),                         "Empty nonce");
-        require(counterparty != msg.sender,                       "Self-swap");
+        if (ethAmount   < MIN_ETH)      revert EthTooSmall();
+        if (usdcAmount  < MIN_USDC)     revert UsdcTooSmall();
+        if (duration    < MIN_DURATION) revert DurationTooShort();
+        if (duration    > MAX_DURATION) revert DurationTooLong();
+        if (secretHash == bytes32(0))   revert EmptySecretHash();
+        if (nonce      == bytes32(0))   revert EmptyNonce();
+        if (counterparty == msg.sender) revert SelfSwap();
 
-        // ── [FIX4] collusion check ───────────────────────────────────
         if (counterparty != address(0)) {
-            require(
-                !collusionFlag[msg.sender][counterparty] &&
-                !collusionFlag[counterparty][msg.sender],
-                "Collusion flag active"
-            );
+            if (_isCollusionActive(msg.sender, counterparty)) revert CollusionFlagActive();
         }
 
-        // ── replay protection ────────────────────────────────────────
-        require(!usedSecretHashes[secretHash],                    "SecretHash reused");
+        if (usedSecretHashes[secretHash]) revert SecretHashReused();
         usedSecretHashes[secretHash] = true;
 
-        // ── [FIX3] rate limit ────────────────────────────────────────
-        {
-            RateLimit storage rl = rateLimit[msg.sender];
-            require(
-                block.timestamp >= rl.lastInitiatedAt + INITIATE_COOLDOWN,
-                "Initiate cooldown active"
-            );
-            require(rl.activeCount < MAX_ACTIVE_PER_USER,         "Too many active swaps");
-            rl.lastInitiatedAt = block.timestamp;
-            rl.activeCount++;
-        }
+        RateLimit storage rl = rateLimit[msg.sender];
+        if (block.timestamp < rl.lastInitiatedAt + INITIATE_COOLDOWN) revert InitiateCooldownActive();
+        if (rl.activeCount >= MAX_ACTIVE_PER_USER)                      revert TooManyActiveSwaps();
+        rl.lastInitiatedAt = block.timestamp;
+        rl.activeCount++;
 
-        // ── amounts ──────────────────────────────────────────────────
         uint256 aCollateral = calcCollateralEth(ethAmount);
         uint256 bCollateral = calcCollateralUsdc(usdcAmount);
         uint256 aPremium    = calcPremium(ethAmount);
-        uint256 required    = ethAmount + aCollateral + aPremium;
-        require(msg.value == required,                            "Wrong ETH deposit");
+        if (msg.value != ethAmount + aCollateral + aPremium) revert WrongEthDeposit();
 
-        // ── timing ───────────────────────────────────────────────────
         uint256 deadline       = block.timestamp + duration;
         uint256 revealDeadline = deadline - SECRET_REVEAL_BUFFER;
-        require(revealDeadline > block.timestamp,                 "Duration too short for buffer");
+        if (revealDeadline <= block.timestamp) revert BufferTooShort();
 
-        // ── [FIX2] swapId derived from commitment — MEV-proof ────────
         swapId = keccak256(abi.encodePacked(commitment, block.chainid));
-        require(swaps[swapId].state == State.EMPTY,               "ID collision");
+        if (swaps[swapId].state != State.EMPTY) revert IdCollision();
 
-        // ── write swap ───────────────────────────────────────────────
         swaps[swapId] = Swap({
             initiator:      payable(msg.sender),
             counterparty:   payable(counterparty),
@@ -419,15 +578,10 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
 
     // ════════════════════════════════════════════════════════════════
     //  STEP 2 — FUND
-    //
-    //  B deposits usdcAmount + bCollateral.
-    //
-    //  [FIX1] B's collateral is locked — burned symmetrically on grief
-    //  [FIX3] FUND_COOLDOWN prevents rapid fund → refund cycling:
-    //         Without it, B could fund() → wait → refund() → collect
-    //         A's premium → repeat with a new swap indefinitely.
     // ════════════════════════════════════════════════════════════════
 
+    /// @notice Fund a swap as counterparty by depositing USDC + collateral.
+    /// @param  swapId The swap to fund
     function fund(bytes32 swapId)
         external
         nonReentrant
@@ -436,328 +590,190 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
     {
         Swap storage s = swaps[swapId];
 
+        if (block.timestamp > s.revealDeadline) revert RevealWindowClosed();
+
         if (s.counterparty != address(0)) {
-            require(msg.sender == s.counterparty,  "Not your swap");
+            if (msg.sender != s.counterparty) revert NotCounterparty();
+            if (_isCollusionActive(msg.sender, s.initiator)) revert CollusionFlagActive();
         } else {
-            require(msg.sender != s.initiator,     "Self-fund");
-            // [FIX4] open swap — check collusion with initiator
-            require(
-                !collusionFlag[msg.sender][s.initiator] &&
-                !collusionFlag[s.initiator][msg.sender],
-                "Collusion flag active"
-            );
+            if (msg.sender == s.initiator) revert SelfFund();
+            if (_isCollusionActive(msg.sender, s.initiator)) revert CollusionFlagActive();
             s.counterparty = payable(msg.sender);
         }
 
-        // [FIX3] fund cooldown
-        {
-            RateLimit storage rl = rateLimit[msg.sender];
-            require(
-                block.timestamp >= rl.lastFundedAt + FUND_COOLDOWN,
-                "Fund cooldown active"
-            );
-            require(rl.activeCount < MAX_ACTIVE_PER_USER, "Too many active swaps");
-            rl.lastFundedAt = block.timestamp;
-            rl.activeCount++;
-        }
+        RateLimit storage rl = rateLimit[msg.sender];
+        if (block.timestamp < rl.lastFundedAt + FUND_COOLDOWN) revert FundCooldownActive();
+        if (rl.activeCount >= MAX_ACTIVE_PER_USER)               revert TooManyActiveSwaps();
+        rl.lastFundedAt = block.timestamp;
+        rl.activeCount++;
 
         s.state = State.FUNDED;
 
-        // [FIX1] B deposits principal + collateral
         USDC.safeTransferFrom(msg.sender, address(this), s.usdcAmount + s.bCollateral);
 
-        emit Funded(swapId, msg.sender, block.timestamp);
+        emit Funded(swapId, msg.sender);
     }
 
     // ════════════════════════════════════════════════════════════════
     //  STEP 3 — COMPLETE
-    //
-    //  A reveals the secret; both assets are exchanged atomically.
-    //
-    //  [FIX5] Secret type is bytes32 → fixed 32 bytes by the EVM.
-    //         Hashed as keccak256(abi.encode(secret, nonce)) where
-    //         abi.encode produces a fixed 64-byte input.
-    //         This eliminates length-extension and birthday attacks
-    //         on truncated hashes entirely.
-    //
-    //  [FIX6] revealDeadline includes TIMESTAMP_DRIFT_BUFFER so a
-    //         validator cannot push block.timestamp just past the
-    //         window to block a legitimate reveal.
-    //
-    //  [FIX1] On success: both collaterals are returned to their owners.
-    //         A receives: aCollateral + aPremium (ETH) + usdcAmount
-    //         B receives: ethAmount (ETH) + bCollateral (USDC)
     // ════════════════════════════════════════════════════════════════
 
-    function complete(bytes32 swapId, bytes32 secret)
-        external
-        nonReentrant
-        onlyState(swapId, State.FUNDED)
-    {
+    /// @dev Shared completion logic.
+    function _executeCompletion(bytes32 swapId, bytes32 secret) internal {
         Swap storage s = swaps[swapId];
 
-        require(msg.sender == s.initiator,  "Only initiator");
-        require(block.timestamp < s.deadline, "Expired");
-
-        // [FIX6] allow reveal up to revealDeadline + drift buffer
-        require(
-            block.timestamp <= s.revealDeadline + TIMESTAMP_DRIFT_BUFFER,
-            "Reveal window closed"
-        );
-
-        // [FIX5] bytes32 type enforces 32-byte length at the EVM level
-        require(secret != bytes32(0), "Empty secret");
-
-        // Verify with nonce — abi.encode gives a fixed 64-byte preimage
-        require(
-            keccak256(abi.encode(secret, s.nonce)) == s.secretHash,
-            "Wrong secret"
-        );
+        if (s.state != State.FUNDED) revert WrongState();
+        if (block.timestamp > s.revealDeadline + TIMESTAMP_DRIFT_BUFFER) revert RevealWindowClosed();
+        if (secret == bytes32(0)) revert EmptySecret();
+        if (keccak256(abi.encode(secret, s.nonce)) != s.secretHash) revert WrongSecret();
 
         s.secret = secret;
         s.state  = State.COMPLETED;
 
-        _decrementActive(s.initiator);
-        _decrementActive(s.counterparty);
-        _updateRep(s.initiator,    true, false);
-        _updateRep(s.counterparty, true, false);
-        _addVolume(s.initiator,    s.ethAmount);
-        _addVolume(s.counterparty, s.ethAmount);
+        address initiator    = s.initiator;
+        address counterparty = s.counterparty;
 
-        // Return collaterals; distribute principal cross-party
-        _queueEth(s.initiator,    s.aCollateral + s.aPremium);
-        _queueEth(s.counterparty, s.ethAmount);
+        _decrementActive(initiator);
+        _decrementActive(counterparty);
+        _repCompleted(initiator, counterparty, s.ethAmount);
 
-        USDC.safeTransfer(s.initiator,    s.usdcAmount);
-        USDC.safeTransfer(s.counterparty, s.bCollateral);
+        _queueEth(initiator,    s.aCollateral + s.aPremium);
+        _queueEth(counterparty, s.ethAmount);
+        _queueUsdc(initiator,    s.usdcAmount);
+        _queueUsdc(counterparty, s.bCollateral);
 
-        emit Completed(swapId, secret, block.timestamp);
+        emit Completed(swapId, secret);
+    }
+
+    /// @notice Complete the swap by revealing the secret (initiator path).
+    function complete(bytes32 swapId, bytes32 secret) external nonReentrant {
+        if (msg.sender != swaps[swapId].initiator) revert NotInitiator();
+        _executeCompletion(swapId, secret);
+    }
+
+    /// @notice Complete the swap by revealing the secret (counterparty path).
+    function claimAsCounterparty(bytes32 swapId, bytes32 secret) external nonReentrant {
+        if (msg.sender != swaps[swapId].counterparty) revert NotCounterparty();
+        _executeCompletion(swapId, secret);
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  CLAIM AS COUNTERPARTY
-    //
-    //  Scenario: A called complete() → secret is now public on-chain
-    //  via the Completed event, but the ETH transfer to B failed
-    //  (e.g. A is a contract with a broken receive()). B reads the
-    //  secret from the event log and calls this function to claim ETH.
-    //
-    //  Note: [FIX5] revealDeadline is NOT checked here — B is reacting
-    //  to a secret A already revealed. The reveal timing was already
-    //  validated inside complete().
+    //  REFUND
     // ════════════════════════════════════════════════════════════════
 
-    function claimAsCounterparty(bytes32 swapId, bytes32 secret)
-        external
-        nonReentrant
-        onlyState(swapId, State.FUNDED)
-    {
+    /// @notice Refund a swap after its effective expiry.
+    /// @param  swapId Swap identifier
+    function refund(bytes32 swapId) external nonReentrant {
         Swap storage s = swaps[swapId];
 
-        require(msg.sender == s.counterparty, "Not counterparty");
-        require(block.timestamp < s.deadline, "Expired");
-        require(secret != bytes32(0),         "Empty secret");
-        require(
-            keccak256(abi.encode(secret, s.nonce)) == s.secretHash,
-            "Wrong secret"
-        );
-
-        s.secret = secret;
-        s.state  = State.COMPLETED;
-
-        _decrementActive(s.initiator);
-        _decrementActive(s.counterparty);
-        _updateRep(s.initiator,    true, false);
-        _updateRep(s.counterparty, true, false);
-
-        _queueEth(s.initiator,    s.aCollateral + s.aPremium);
-        _queueEth(s.counterparty, s.ethAmount);
-
-        USDC.safeTransfer(s.initiator,    s.usdcAmount);
-        USDC.safeTransfer(s.counterparty, s.bCollateral);
-
-        emit Completed(swapId, secret, block.timestamp);
-    }
-
-    // ════════════════════════════════════════════════════════════════
-    //  REFUND — deadline expired
-    //
-    //  Case 1: State.INITIATED (B never funded)
-    //    No violation → A gets everything back, no reputation hit.
-    //
-    //  Case 2: State.FUNDED (both deposited, A never revealed)
-    //    A violated the protocol:
-    //    → aCollateral  burned  (MAD punishment for A)
-    //    → bCollateral  burned  ([FIX1] symmetric — prevents collusion)
-    //    → aPremium     → B     (compensation for B's locked time)
-    //    → ethAmount    → A     (principal returned)
-    //    → usdcAmount   → B     (principal returned)
-    //
-    //  Why burn bCollateral symmetrically? [FIX1]
-    //    Without it, A and B could collude: "Don't reveal, we both
-    //    refund, you recover your premium from another swap."
-    //    If B also loses collateral, the collusion is unprofitable.
-    //
-    //  [FIX4] Collusion detection:
-    //    If A has griefed ≥ 2 times, or B has ≥ 2 refunded swaps,
-    //    the pair is permanently flagged — they cannot swap again.
-    // ════════════════════════════════════════════════════════════════
-
-    function refund(bytes32 swapId)
-        external
-        nonReentrant
-        afterDeadline(swapId)
-    {
-        Swap storage s = swaps[swapId];
-
-        require(
-            s.state == State.INITIATED || s.state == State.FUNDED,
-            "Cannot refund"
-        );
-
-        bool aGriefed = (s.state == State.FUNDED);
-        bool bGriefed = aGriefed; // symmetric
-
-        s.state = State.REFUNDED;
-        _decrementActive(s.initiator);
-
-        if (aGriefed) {
-            _decrementActive(s.counterparty);
-            _updateRep(s.initiator, false, true);
-
-            // [FIX4] flag collusion if pattern is detected
-            if (reputation[s.initiator].griefed >= 2 ||
-                reputation[s.counterparty].refunded >= 2) {
-                _flagCollusion(s.initiator, s.counterparty);
-            }
-
-            // [FIX1] burn A's collateral
-            _queueEth(BURN_ADDRESS, s.aCollateral);
-
-            // [FIX1] burn B's collateral symmetrically
-            USDC.safeTransfer(BURN_ADDRESS, s.bCollateral);
-
-            // premium → B as compensation for griefing
-            _queueEth(s.counterparty, s.aPremium);
-
-            // principals returned
-            _queueEth(s.initiator,           s.ethAmount);
-            USDC.safeTransfer(s.counterparty, s.usdcAmount);
-
-        } else {
-            // B simply did not show up — honest refund for A
-            _updateRep(s.initiator, false, false);
-            _queueEth(s.initiator, s.ethAmount + s.aCollateral + s.aPremium);
+        if (s.state != State.INITIATED && s.state != State.FUNDED) {
+            revert CannotRefund();
         }
 
-        emit Refunded(swapId, aGriefed, bGriefed, block.timestamp);
+        bool griefed = (s.state == State.FUNDED);
+
+        if (griefed) {
+            if (block.timestamp <= s.revealDeadline + TIMESTAMP_DRIFT_BUFFER) {
+                revert NotExpired();
+            }
+            if (msg.sender != s.initiator && msg.sender != s.counterparty) {
+                revert NotInitiatorOrCounterparty();
+            }
+        } else {
+            if (block.timestamp < s.deadline + TIMESTAMP_DRIFT_BUFFER) {
+                revert NotExpired();
+            }
+            if (msg.sender != s.initiator) {
+                revert NotInitiator();
+            }
+        }
+
+        s.state = State.REFUNDED;
+
+        address initiator    = s.initiator;
+        address counterparty = s.counterparty;
+
+        _decrementActive(initiator);
+
+        if (griefed) {
+            _decrementActive(counterparty);
+            _repGriefed(initiator, counterparty);
+
+            _queueEth(initiator,     s.ethAmount);
+            _queueUsdc(counterparty, s.usdcAmount);
+            _queueEth(counterparty,  s.aPremium);
+
+            _burnUsdc(s.bCollateral);
+            _burnEth(s.aCollateral);
+        } else {
+            _queueEth(initiator, s.ethAmount + s.aCollateral + s.aPremium);
+        }
+
+        emit Refunded(swapId, griefed, msg.sender);
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  CANCEL — only before B funds
-    //
-    //  A may cancel while the swap is in INITIATED state.
-    //  aCollateral is returned; aPremium is burned as a penalty
-    //  to discourage creating swaps with no intent to complete.
+    //  CANCEL
     // ════════════════════════════════════════════════════════════════
 
+    /// @notice Cancel an unfunded (INITIATED) swap before the deadline.
+    /// @param  swapId Swap identifier
     function cancel(bytes32 swapId)
         external
         nonReentrant
         onlyState(swapId, State.INITIATED)
+        beforeDeadline(swapId)
     {
         Swap storage s = swaps[swapId];
-        require(msg.sender == s.initiator, "Only initiator");
+        if (msg.sender != s.initiator) revert NotInitiator();
 
         s.state = State.CANCELLED;
         _decrementActive(s.initiator);
-        _updateRep(s.initiator, false, false);
+        _repCancelled(s.initiator);
 
-        // collateral returned; premium burned as cancellation penalty
-        _queueEth(s.initiator,  s.ethAmount + s.aCollateral);
-        _queueEth(BURN_ADDRESS, s.aPremium);
+        _queueEth(s.initiator, s.ethAmount + s.aCollateral);
+        _burnEth(s.aPremium);
 
-        emit Cancelled(swapId, block.timestamp);
+        emit Cancelled(swapId);
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  [FIX4] COLLUSION FLAG — internal
-    //
-    //  Detection logic:
-    //  Two addresses repeatedly refund against each other →
-    //  pattern suggests collusion to drain premiums or game the system.
-    //  Flagging permanently bans them from swapping with each other.
-    //
-    //  Limitation: this is a heuristic, not cryptographic proof.
-    //  Honest users could theoretically be caught. The threshold
-    //  (griefed ≥ 2) is intentionally conservative to reduce false
-    //  positives.
+    //  WITHDRAWAL (pull-payment)
     // ════════════════════════════════════════════════════════════════
 
-    function _flagCollusion(address a, address b) internal {
-        if (!collusionFlag[a][b]) {
-            collusionFlag[a][b] = true;
-            collusionFlag[b][a] = true;
-            emit CollusionFlagged(a, b);
-        }
-    }
+    /// @notice Withdraw all pending ETH.
+    function withdrawEth() external nonReentrant {
+        uint256 amount = pendingEthWithdrawals[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
 
-    // ════════════════════════════════════════════════════════════════
-    //  PULL-PAYMENT — ETH withdrawal pattern
-    //
-    //  Instead of pushing ETH in every function (vulnerable to DoS
-    //  via a contract with a reverting receive()), ETH is queued.
-    //  Recipients call withdraw() themselves.
-    // ════════════════════════════════════════════════════════════════
-
-    function withdraw() external nonReentrant {
-        uint256 amount = pendingWithdrawals[msg.sender];
-        require(amount > 0, "Nothing to withdraw");
-
-        pendingWithdrawals[msg.sender] = 0;
-
+        delete pendingEthWithdrawals[msg.sender];
         (bool ok,) = payable(msg.sender).call{value: amount}("");
-        require(ok, "ETH withdraw failed");
+        if (!ok) revert EthWithdrawFailed();
 
-        emit Withdrawn(msg.sender, amount);
+        emit EthWithdrawn(msg.sender, amount);
     }
 
-    function _queueEth(address recipient, uint256 amount) internal {
-        if (amount == 0 || recipient == address(0)) return;
-        pendingWithdrawals[recipient] += amount;
-        emit WithdrawalQueued(recipient, amount);
-    }
+    /// @notice Withdraw all pending USDC.
+    function withdrawUsdc() external nonReentrant {
+        uint256 amount = pendingUsdcWithdrawals[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
 
-    // ════════════════════════════════════════════════════════════════
-    //  INTERNAL UTILITIES
-    // ════════════════════════════════════════════════════════════════
+        delete pendingUsdcWithdrawals[msg.sender];
+        USDC.safeTransfer(msg.sender, amount);
 
-    function _updateRep(address user, bool success, bool isGrief) internal {
-        Reputation storage r = reputation[user];
-        if (success)      { r.completed++; }
-        else if (isGrief) { r.griefed++; r.refunded++; }
-        else              { r.refunded++; }
-    }
-
-    function _addVolume(address user, uint256 ethWei) internal {
-        unchecked {
-            reputation[user].totalVolumeGwei += uint64(ethWei / 1 gwei);
-        }
-    }
-
-    function _decrementActive(address user) internal {
-        if (rateLimit[user].activeCount > 0) rateLimit[user].activeCount--;
+        emit UsdcWithdrawn(msg.sender, amount);
     }
 
     // ════════════════════════════════════════════════════════════════
     //  VIEW FUNCTIONS
     // ════════════════════════════════════════════════════════════════
 
+    /// @notice Get full swap details
     function getSwap(bytes32 swapId) external view returns (Swap memory) {
         return swaps[swapId];
     }
 
-    /// @notice Build the commitment hash off-chain before calling commitInitiate()
+    /// @notice Build commitment hash (frontend helper)
     function buildCommitment(
         bytes32 secretHash,
         bytes32 nonce,
@@ -775,22 +791,59 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
         ));
     }
 
-    /// @notice Build secretHash off-chain: keccak256(abi.encode(secret, nonce))
+    /// @notice Build secret hash (frontend helper)
     function buildSecretHash(bytes32 secret, bytes32 nonce)
-        external
-        pure
-        returns (bytes32)
+        external pure returns (bytes32)
     {
         return keccak256(abi.encode(secret, nonce));
     }
 
-    /// @notice Reputation score: completed*10 - refunded*8 - griefed*15 - cancelled*3
-    function getScore(address user) external view returns (int256) {
-        Reputation memory r = reputation[user];
-        return int256(uint256(r.completed))  * 10
-             - int256(uint256(r.refunded))   *  8
-             - int256(uint256(r.griefed))    * 15
-             - int256(uint256(r.cancelled))  *  3;
+    /// @notice Calculate reputation score
+    function getScore(address user) public view returns (int256) {
+        Reputation storage r = reputation[user];
+        return  int256(uint256(r.completed)) * 10
+              - int256(uint256(r.griefed))   * 20
+              - int256(uint256(r.cancelled)) *  3;
+    }
+
+    /// @notice Get full reputation details
+    function getReputation(address user)
+        external
+        view
+        returns (
+            uint64  completed,
+            uint64  griefed,
+            uint64  victimized,
+            uint64  cancelled,
+            uint128 volumeGwei,
+            int256  score
+        )
+    {
+        Reputation storage r = reputation[user];
+        return (
+            r.completed,
+            r.griefed,
+            r.victimized,
+            r.cancelled,
+            r.volumeGwei,
+            getScore(user)
+        );
+    }
+
+    /// @notice Check if collusion flag is active between two addresses
+    function isCollusionFlagActive(address a, address b)
+        external view returns (bool active, uint256 expiryTime)
+    {
+        active     = _isCollusionActive(a, b);
+        expiryTime = collusionFlagExpiry[a][b];
+    }
+
+    /// @notice Get canonical-pair grief count (order-independent)
+    function getPairGriefCount(address a, address b)
+        external view returns (uint32)
+    {
+        (address lo, address hi) = _canonicalPair(a, b);
+        return pairGriefCount[lo][hi];
     }
 
     /// @notice Seconds remaining until swap deadline (0 if expired)
@@ -799,19 +852,17 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
         return block.timestamp >= dl ? 0 : dl - block.timestamp;
     }
 
-    /// @notice Whether the secret reveal window is still open
+    /// @notice Whether the reveal window is currently open
     function revealWindowOpen(bytes32 swapId) external view returns (bool) {
         return block.timestamp <=
             swaps[swapId].revealDeadline + TIMESTAMP_DRIFT_BUFFER;
     }
 
-    /// @notice Check whether an address can initiate a new swap
+    /// @notice Check if a user can initiate a new swap right now
     function canInitiate(address user)
-        external
-        view
-        returns (bool ok, string memory reason)
+        external view returns (bool ok, string memory reason)
     {
-        RateLimit memory rl = rateLimit[user];
+        RateLimit storage rl = rateLimit[user];
         if (rl.activeCount >= MAX_ACTIVE_PER_USER)
             return (false, "Too many active swaps");
         if (block.timestamp < rl.lastInitiatedAt + INITIATE_COOLDOWN)
@@ -819,7 +870,20 @@ contract SecureEthUsdcSwapV3 is ReentrancyGuard {
         return (true, "");
     }
 
+    /// @notice Get pending withdrawal balances for a user
+    function getPendingWithdrawals(address user)
+        external view returns (uint256 pendingEth, uint256 pendingUsdc)
+    {
+        pendingEth  = pendingEthWithdrawals[user];
+        pendingUsdc = pendingUsdcWithdrawals[user];
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  FALLBACK
+    // ════════════════════════════════════════════════════════════════
+
+    /// @notice Reject direct ETH transfers — use initiateFromCommit()
     receive() external payable {
-        revert("Use initiateFromCommit()");
+        revert UseInitiateFromCommit();
     }
 }
